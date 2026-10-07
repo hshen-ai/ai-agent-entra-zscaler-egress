@@ -1,0 +1,16 @@
+# Filled-in configuration and secrets — never commit
+config/agent0.env.app
+config/agent0.env.agent
+config/todo0.env.app
+config/todo0.env.mcp
+config/bedrock.env
+config/zscaler-root-ca.crt
+app/zscaler-root-ca.crt
+entra-setup/out/
+entra-setup/entra-automation.json
+entra-setup/*.key
+entra-setup/*.crt
+*.pem
+node_modules/
+dist/
+.DS_Store

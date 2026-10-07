@@ -1,4 +1,10 @@
-const API_BASE_URL = 'http://localhost:3000';
+// Same-origin, deliberately empty. Was 'http://localhost:3000', which broke every fetch as soon as
+// the page came from any other origin: over ZPA the browser resolved localhost:3000 to the USER's own
+// machine, and this app's own CSP `connect-src 'self'` would have blocked the cross-origin call in any
+// case. Empty keeps all ten call sites as `${API_BASE_URL}/path` -> a relative path, so the UI follows
+// whatever origin served it - localhost through the SSH tunnel, or agent0.h*******o.internal:3000
+// through ZPA. Do not put a second absolute origin here; that only moves the breakage.
+const API_BASE_URL = '';
 
 // ============================================================================
 // XSS Prevention: HTML Escape Utility

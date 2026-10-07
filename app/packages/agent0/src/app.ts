@@ -171,8 +171,19 @@ export class AppServer {
           //   already allowed in scriptSrc (dompurify, marked, iconify).
           connectSrc: ["'self'", 'https://api.iconify.design', 'https://cdn.jsdelivr.net'],
           imgSrc: ["'self'", 'data:', 'https:'],
+          // This origin is HTTP on purpose (every Okta redirect URI here is http://), and helmet's
+          // DEFAULT set includes upgrade-insecure-requests, which rewrites every fetch from this page
+          // to https://<host>:<same port>. Nothing serves TLS on that port, so the browser reports
+          // `Failed to fetch` and the UI hangs on "Connecting to server...". Invisible on localhost,
+          // which is exempt from the upgrade as a potentially-trustworthy origin - so it only breaks
+          // off-host, e.g. through ZPA. Measured 2026-09-16.
+          upgradeInsecureRequests: null,
         },
       },
+      // Also a helmet default. A browser ignores an STS header received over plain HTTP, so it is
+      // inert today - but it would pin these hostnames to HTTPS for a year the moment anything
+      // serves them over TLS. Removed here rather than left as a trap for the next person.
+      hsts: false,
     }));
 
     this.app.use(express.json());
@@ -393,6 +404,27 @@ export class AppServer {
     // Returns env-derived state for the anonymous/logged-out case, and
     // enriches "connected" flags with per-user runtime state when the
     // caller has an active session.
+    // How the two levels of ZIA egress identity are read back, without guessing from log lines.
+    // DECODED CLAIMS ONLY - never a token. `session` is this caller's own token, minted by their
+    // login; `process` is the container's own. `session: null` is the fail-closed state and means
+    // the next Bedrock call from this session gets a 407, which is intended, not a bug.
+    this.app.get('/api/zia/status', (req, res) => {
+      const ziaShow = (jwt: any) => {
+        try {
+          const c = JSON.parse(Buffer.from(String(jwt).split(".")[1], "base64url").toString());
+          return { sub: c.sub, exp: new Date(c.exp * 1000).toISOString() };
+        } catch {
+          return null;
+        }
+      };
+      const ziaSessionJwt = (req.session as any).ziaToken;
+      res.json({
+        session: ziaSessionJwt ? ziaShow(ziaSessionJwt) : null,
+        process: ziaProcessClaims
+          ? { sub: ziaProcessClaims.sub, exp: new Date(ziaProcessClaims.exp * 1000).toISOString() }
+          : null,
+      });
+    });
     this.app.get('/api/connections/status', async (req, res) => {
       try {
         const agent = await getAgentForSession(req).catch(() => null);
@@ -424,6 +456,9 @@ export class AppServer {
   // ============================================================================
 
   async start(): Promise<void> {
+    // The container's own egress identity. No-ops with one log line when .env.zia is absent, and
+    // never awaited: minting is three Okta round trips and must not delay app.listen().
+    ziaStartProcessToken();
     return new Promise<void>((resolve) => {
       this.app.listen(this.config.port, () => {
         console.log('='.repeat(60));
@@ -449,3 +484,164 @@ export class AppServer {
     });
   }
 }
+// --- ZIA process-level egress token ------------------------------------------------------------
+// The container's OWN egress identity, as a*************d@o**a.h***n.de, obtained with no human in
+// the loop. The per-login session token is handled elsewhere (patch_agent0_zia_token.py ->
+// patch_agent0_session_token.py -> patch_bedrock_zia_proxy.py) and these two levels never fall back
+// to each other: a user session without a token gets a 407 rather than quietly egressing as the
+// workload, because per-user attribution is the whole point of the JWT path.
+//
+// The leg order below is the one probe_zia_process_token.js measured inside this container on
+// 2026-09-16, not a guess:
+//   1  POST /api/v1/authn                                 -> status=SUCCESS + one-time sessionToken
+//   2  GET <AS>/v1/authorize?prompt=none&sessionToken=...  -> 302 carrying code=
+//   3  POST <AS>/v1/token grant_type=authorization_code    -> sub=a*************d@o**a.h***n.de
+// and a CONNECT with the result returned 200 while the same CONNECT without it returned 407.
+// Whether a CUSTOM authorization server consumes `sessionToken` at all was the one open question in
+// the design - it does, so the cookie-jar route through /login/sessionCookieRedirect is not needed.
+// A sessionToken is ONE-TIME and leg 2 consumes it even on failure, so every retry restarts at leg 1.
+const ziaProcFs = require("fs");
+const ziaProcCrypto = require("crypto");
+// This package compiles with lib ES2020 and no DOM lib, so tsc does not necessarily declare the
+// global fetch even though Node v20.20.2 in this image always has it - and it honours
+// NODE_EXTRA_CA_CERTS, which is required here because ZIA re-signs every TLS connection. Reaching it
+// through globalThis keeps the build independent of which @types/node happens to be installed.
+const ziaProcFetch: any = (globalThis as any).fetch;
+
+// Bind-mounted read-only from a mode-600 file on the VM, exactly like .env.app. NOT the environment:
+// `-e` puts the password in the `docker run` argv, and both `-e` and `--env-file` put it in
+// Config.Env, which `docker inspect` prints for the container's whole lifetime.
+const ziaProcEnvFile = process.env.ZIA_WORKLOAD_ENV_FILE ?? "/app/packages/agent0/.env.zia";
+// Deliberately a DIFFERENT file from ZIA_TOKEN_FILE, so a process-level token can never be picked up
+// as a stand-in for a missing session token.
+const ziaProcTokenFile = process.env.ZIA_PROCESS_TOKEN_FILE
+  ?? "/app/packages/agent0/.zia-process-token.jwt";
+
+let ziaProcessClaims: { sub: string; exp: number } | null = null;
+
+function ziaProcCredentials(): { user: string; password: string } | null {
+  try {
+    const ziaVals: Record<string, string> = {};
+    for (const line of ziaProcFs.readFileSync(ziaProcEnvFile, "utf8").split("\n")) {
+      const m = /^([A-Z0-9_]+)\s*=\s*(.*)$/.exec(line.trim());
+      if (m) ziaVals[m[1]] = m[2].replace(/^["']|["']$/g, "");
+    }
+    if (!ziaVals.ZIA_WORKLOAD_USER || !ziaVals.ZIA_WORKLOAD_PASSWORD) return null;
+    return { user: ziaVals.ZIA_WORKLOAD_USER, password: ziaVals.ZIA_WORKLOAD_PASSWORD };
+  } catch {
+    // Missing file, or a directory where docker created one because the mount source did not
+    // exist. Both mean "not configured", which the caller reports as such.
+    return null;
+  }
+}
+
+async function ziaProcMint(cred: any): Promise<string> {
+  const ziaDomain = process.env.OKTA_DOMAIN ?? "";
+  const ziaIssuer = process.env.ZIA_EGRESS_ISSUER
+    ?? "https://" + ziaDomain + "/oauth2/aus1xxxxxxxxxxxxE698";
+
+  // Leg 1. The password never leaves this function and is never logged.
+  const ziaAuthnRes = await ziaProcFetch("https://" + ziaDomain + "/api/v1/authn", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      username: cred.user,
+      password: cred.password,
+      options: { multiOptionalFactorEnroll: false, warnBeforePasswordExpired: false },
+    }),
+  });
+  const ziaAuthn: any = await ziaAuthnRes.json().catch(() => ({}));
+  if (ziaAuthn.status !== "SUCCESS" || !ziaAuthn.sessionToken) {
+    // Name the state, because each one needs a different fix and two of them are Console work:
+    // MFA_REQUIRED / MFA_ENROLL means this user still matches a 2FA authentication policy,
+    // 401 E0000004 means a wrong password or a user that was never activated.
+    throw new Error("authn " + (ziaAuthn.status ?? "HTTP " + ziaAuthnRes.status)
+      + " " + (ziaAuthn.errorCode ?? ""));
+  }
+
+  // Leg 2. Same app, same single registered redirect_uri, same prompt=none as the browser flow -
+  // no Okta app object has to be modified. redirect: "manual" so the 302 is read rather than
+  // followed: the code must not be delivered to our own callback, which belongs to user sessions.
+  const ziaVerifier = ziaProcCrypto.randomBytes(32).toString("base64url");
+  const ziaQuery = new URLSearchParams();
+  ziaQuery.append("client_id", process.env.OKTA_CLIENT_ID ?? "");
+  ziaQuery.append("response_type", "code");
+  ziaQuery.append("redirect_uri", process.env.OKTA_REDIRECT_URI ?? "");
+  ziaQuery.append("scope", process.env.ZIA_EGRESS_SCOPE ?? "zia:egress");
+  ziaQuery.append("state", "ziaproc." + ziaProcCrypto.randomBytes(16).toString("hex"));
+  ziaQuery.append("prompt", "none");
+  ziaQuery.append("code_challenge_method", "S256");
+  ziaQuery.append("code_challenge",
+    ziaProcCrypto.createHash("sha256").update(ziaVerifier).digest("base64url"));
+  ziaQuery.append("sessionToken", ziaAuthn.sessionToken);
+  const ziaAuthzRes = await ziaProcFetch(ziaIssuer + "/v1/authorize?" + ziaQuery.toString(),
+    { redirect: "manual" });
+  const ziaLoc = ziaAuthzRes.headers.get("location");
+  const ziaCode = ziaLoc ? new URL(ziaLoc, "http://localhost").searchParams.get("code") : null;
+  if (!ziaCode) {
+    // HTTP 200 here means the Sign-In widget, i.e. the sessionToken was not accepted; a 302 with
+    // error=login_required means prompt=none found no usable session.
+    throw new Error("authorize?sessionToken produced no code: HTTP " + ziaAuthzRes.status);
+  }
+
+  // Leg 3. append(), never an object literal: under "strict": true a literal holding a union with
+  // undefined is a TS2345, which is how an earlier attempt at the session-level patch failed.
+  const ziaBody = new URLSearchParams();
+  ziaBody.append("grant_type", "authorization_code");
+  ziaBody.append("code", ziaCode);
+  ziaBody.append("redirect_uri", process.env.OKTA_REDIRECT_URI ?? "");
+  ziaBody.append("code_verifier", ziaVerifier);
+  ziaBody.append("client_id", process.env.OKTA_CLIENT_ID ?? "");
+  ziaBody.append("client_secret", process.env.OKTA_CLIENT_SECRET ?? "");
+  const ziaTokRes = await ziaProcFetch(ziaIssuer + "/v1/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+    },
+    body: ziaBody.toString(),
+  });
+  const ziaTok: any = await ziaTokRes.json().catch(() => ({}));
+  if (ziaTokRes.status !== 200 || !ziaTok.access_token) {
+    // Okta's error fields only, never the body: a partial success can carry a token.
+    throw new Error("token endpoint HTTP " + ziaTokRes.status + " " + (ziaTok.error ?? "")
+      + " " + (ziaTok.error_description ?? ""));
+  }
+  return ziaTok.access_token;
+}
+
+function ziaStartProcessToken(): void {
+  const ziaCred = ziaProcCredentials();
+  if (!ziaCred) {
+    console.log("[ZIA] no process-level egress identity: " + ziaProcEnvFile
+      + " has no ZIA_WORKLOAD_USER/ZIA_WORKLOAD_PASSWORD."
+      + " The container's own egress stays unauthenticated; user sessions are unaffected.");
+    return;
+  }
+  const ziaRun = async () => {
+    try {
+      const ziaJwt = await ziaProcMint(ziaCred);
+      const ziaClaims = JSON.parse(
+        Buffer.from(ziaJwt.split(".")[1], "base64url").toString());
+      ziaProcessClaims = { sub: ziaClaims.sub, exp: ziaClaims.exp };
+      // Truncated in place. Never write-then-mv: a new inode would leave anything holding the old
+      // path - including a bind mount - reading the previous token forever.
+      ziaProcFs.writeFileSync(ziaProcTokenFile, ziaJwt + "\n", { mode: 0o600 });
+      // Claims only, never the token.
+      console.log("[ZIA] process egress token: sub=" + ziaClaims.sub + " aud=" + ziaClaims.aud
+        + " scp=" + ziaClaims.scp + " exp=" + new Date(ziaClaims.exp * 1000).toISOString());
+      // Tokens live 60 minutes; re-mint 10 minutes early. The floor keeps a clock skew or an
+      // unexpectedly short lifetime from turning this into a hot loop.
+      const ziaNext = Math.max(60000, ziaClaims.exp * 1000 - Date.now() - 600000);
+      setTimeout(ziaRun, ziaNext).unref();
+    } catch (ziaErr: any) {
+      // Degraded, not fatal: the container's own egress is simply unauthenticated until this
+      // succeeds, and no user session is affected either way.
+      console.error("[ZIA] process egress token mint failed: " + ziaErr.message
+        + " - retrying in 60s");
+      setTimeout(ziaRun, 60000).unref();
+    }
+  };
+  void ziaRun();
+}
+// --- end ZIA process-level egress token --------------------------------------------------------

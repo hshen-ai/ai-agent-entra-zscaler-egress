@@ -1,0 +1,25 @@
+{
+  "_comment": "Copy to entra-automation.json. Identity used for unattended Microsoft Graph access by bootstrap_entra_objects.py. Holds NO secret: the private key is in the file named by key_file (mode 600, never commit it). Example values are masked values from the reference lab; see README.md for each.",
+
+  "_tenant_id": "<TENANT_ID> — Directory (tenant) ID. Entra admin center > Overview",
+  "tenant_id": "cddbxxxx-xxxx-xxxx-xxxx-xxxxxxxxf7c6",
+
+  "_tenant_domain": "<TENANT_DOMAIN> — the tenant's verified domain used for test-user UPNs",
+  "tenant_domain": "h*****s.onmicrosoft.com",
+
+  "_client_id": "<AUTOMATION_CLIENT_ID> — Application (client) ID of the automation app registration",
+  "client_id": "cf0cxxxx-xxxx-xxxx-xxxx-xxxxxxxxa24a",
+
+  "_key_file": "<AUTOMATION_KEY_FILE> — PEM private key, path relative to this file",
+  "key_file": "entra-automation.key",
+
+  "_cert_thumbprint_sha1": "<AUTOMATION_CERT_THUMBPRINT> — SHA-1 thumbprint (40 hex) of the certificate uploaded to the app: Certificates & secrets > Certificates",
+  "cert_thumbprint_sha1": "CEE5xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx5502",
+
+  "_graph_app_roles": "Microsoft Graph APPLICATION permissions the automation app needs, with admin consent granted",
+  "graph_app_roles": [
+    "Application.ReadWrite.OwnedBy",
+    "User.ReadWrite.All",
+    "Directory.Read.All"
+  ]
+}

@@ -372,7 +372,30 @@ async function bootstrap(): Promise<void> {
     next();
   });
 
-  const mcpAuthMetadata = await fetch(`${config.mcpOktaIssuer}/.well-known/oauth-authorization-server`).then(res => res.json());
+  // Okta serves RFC 8414 metadata at <issuer>/.well-known/oauth-authorization-server; Entra returns
+  // 404 WITH AN EMPTY BODY there, on both the path-suffix and the root-insert form. `.json()` on an
+  // empty body throws "Unexpected end of JSON input", which names neither URL nor status, and this
+  // runs before listen() - so the MCP child exits at boot while the agent still prints Ready.
+  // Ordered, not branched on IDP: Okta answers the first URL, so its behaviour is unchanged.
+  const mcpMetadataUrls = [
+    `${config.mcpOktaIssuer}/.well-known/oauth-authorization-server`,
+    `${config.mcpOktaIssuer}/.well-known/openid-configuration`,
+  ];
+  let mcpAuthMetadata: any = null;
+  for (const metadataUrl of mcpMetadataUrls) {
+    const metadataRes = await fetch(metadataUrl);
+    const metadataBody = metadataRes.ok ? await metadataRes.text() : '';
+    if (!metadataBody) {
+      console.log(`[MCP] no authorization server metadata at ${metadataUrl} (HTTP ${metadataRes.status}, ${metadataBody.length} bytes) - trying the next URL`);
+      continue;
+    }
+    console.log(`[MCP] authorization server metadata from ${metadataUrl}`);
+    mcpAuthMetadata = JSON.parse(metadataBody);
+    break;
+  }
+  if (!mcpAuthMetadata) {
+    throw new Error(`no authorization server metadata at any of: ${mcpMetadataUrls.join(', ')}`);
+  }
 
   console.log('MCP Auth Metadata:', mcpAuthMetadata);
 

@@ -131,14 +131,35 @@ export class TokenExchangeHandler {
   }
 
   // ============================================================================
+  // Client Authentication for the Token Endpoints
+  // ============================================================================
+
+  /**
+   * Append client authentication to a token request. The AI agent and the agent0
+   * OIDC app are one Okta client, and that client authenticates with a secret, so
+   * prefer client_secret_post when the secret is present. Falls back to the
+   * private_key_jwt assertion when it is not.
+   */
+  private appendClientAuth(form: URLSearchParams, assertionAudience: string): void {
+    const clientSecret = this.config.clientId === process.env.OKTA_CLIENT_ID
+      ? process.env.OKTA_CLIENT_SECRET
+      : undefined;
+
+    if (clientSecret) {
+      form.append('client_id', this.config.clientId);
+      form.append('client_secret', clientSecret);
+      return;
+    }
+
+    form.append('client_assertion_type', 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer');
+    form.append('client_assertion', this.createClientAssertion(assertionAudience));
+  }
+
+  // ============================================================================
   // Step 1: Exchange ID Token for ID-JAG
   // ============================================================================
 
   private async exchangeIdTokenForIdJag(idToken: string, scopes?: string): Promise<string> {
-    const clientAssertion = this.createClientAssertion(
-      `https://${this.config.oktaDomain}/oauth2/v1/token`
-    );
-
     const formData = new URLSearchParams();
     formData.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
     formData.append('requested_token_type', 'urn:ietf:params:oauth:token-type:id-jag');
@@ -146,8 +167,7 @@ export class TokenExchangeHandler {
     formData.append('subject_token_type', 'urn:ietf:params:oauth:token-type:id_token');
     formData.append('audience', this.config.authorizationServer);
     formData.append('scope', scopes || this.config.agentScopes);
-    formData.append('client_assertion_type', 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer');
-    formData.append('client_assertion', clientAssertion);
+    this.appendClientAuth(formData, `https://${this.config.oktaDomain}/oauth2/v1/token`);
 
     const response = await axios.post(
       `https://${this.config.oktaDomain}/oauth2/v1/token`,
@@ -255,13 +275,10 @@ export class TokenExchangeHandler {
     const authorizationServer = this.config.authorizationServer;
     const authorizationServerTokenEndpoint = this.config.authorizationServerTokenEndpoint;
 
-    const clientAssertion = this.createClientAssertion(authorizationServerTokenEndpoint);
-
     const resourceTokenForm = new URLSearchParams();
     resourceTokenForm.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
     resourceTokenForm.append('assertion', idJag);
-    resourceTokenForm.append('client_assertion_type', 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer');
-    resourceTokenForm.append('client_assertion', clientAssertion);
+    this.appendClientAuth(resourceTokenForm, authorizationServerTokenEndpoint);
 
     const response = await axios.post(
       authorizationServerTokenEndpoint,

@@ -143,10 +143,17 @@ router.get('/callback', async (req, res) => {
       (req.session as any).id_token = tokenSet.id_token;
 
       // Store user claims for user-scoped operations
-      (req.session as any).userId = claims.sub;
-      (req.session as any).userEmail = claims.email;
+      // Entra's `sub` is PAIRWISE - scoped to the (user, application) pair - so it is NOT the id the
+      // MCP path keys a todo on. `oid` is the tenant-wide object id and is what requireMcpAuth.ts
+      // falls back to, so both doors into the todo store agree. An Okta ID token carries no `oid`,
+      // so this falls through to `sub` and the Okta demo is unchanged.
+      const sessionUserId = ((claims as any).oid ?? claims.sub) as string;
+      (req.session as any).userId = sessionUserId;
+      // Entra emits `email` only if that optional claim is configured; `preferred_username` always
+      // carries the UPN. Display only - nothing keys on this.
+      (req.session as any).userEmail = claims.email ?? (claims as any).preferred_username;
 
-      console.log('[AUTH] Session regenerated, tokens stored for user:', claims.sub);
+      console.log('[AUTH] Session regenerated, tokens stored for user:', sessionUserId);
       res.redirect('/');
     });
   } catch (err: any) {

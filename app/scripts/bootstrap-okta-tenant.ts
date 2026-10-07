@@ -254,7 +254,7 @@ async function bootstrap() {
           name: 'Agent0 Agent',
           description: 'Agent0 Agent',
         },
-        appId: agent0AppId,
+        signOnProvider: { type: 'EXISTING_APP', appInstanceId: agent0AppId },
       });
 
       // Poll until registration completes
@@ -263,7 +263,7 @@ async function bootstrap() {
 
       // Get agent details
       agentIdentityId = operation.resource.id;
-      agentClientId = agentIdentityId;  // Agent ID is the client ID
+      agentClientId = agent0AppId;  // oauthClient.clientId == signOnProvider.appInstanceId
 
       // Save to rollback state
       rollbackState = updateRollbackState(rollbackState, {
@@ -310,8 +310,7 @@ async function bootstrap() {
       });
     } catch (error: any) {
       spinner.fail(`Agent owner setup failed: ${error.message}`);
-      console.log(chalk.gray('  → Agent activation may fail without owners'));
-      throw error;
+      console.log(chalk.gray('  → Continuing: no owner API is entitled on this org, and the agent registers ACTIVE anyway'));
     }
 
     // Step 8: Upload Public Key to Agent Identity
@@ -338,8 +337,10 @@ async function bootstrap() {
     try {
       // Activate agent (async operation)
       const activationUrl = await agentClient.activateAgent(agentIdentityId);
-      spinner.text = 'Waiting for agent activation to complete...';
-      await agentClient.pollOperation(activationUrl);
+      if (activationUrl) {
+        spinner.text = 'Waiting for agent activation to complete...';
+        await agentClient.pollOperation(activationUrl);
+      }
 
       spinner.succeed('Agent identity activated');
     } catch (error: any) {
@@ -384,8 +385,13 @@ async function bootstrap() {
       spinner.succeed(`Agent connection created: ${chalk.cyan(connection.id)}`);
     } catch (error: any) {
       spinner.fail(`Agent connection creation failed: ${error.message}`);
-      console.log(chalk.gray(`  → Check agent and authorization server in Okta Admin Console`));
-      throw error;
+      console.log(chalk.yellow('  ⚠ Cross App Access is not licensed on this org (401 E0000015).'));
+      // `bootstrapConfig.mcpScopes = mcpScopes` sits after the createConnection call that
+      // just threw, and Step 14 calls .join() on it: 'Cannot read properties of undefined'.
+      bootstrapConfig.mcpScopes = bootstrapConfig.mcpScopes || ['mcp:connect', 'mcp:tools:read', 'mcp:tools:manage'];
+      console.log(chalk.yellow('    Everything else is configured. The agent will NOT be able to'));
+      console.log(chalk.yellow('    obtain an ID-JAG for the MCP server until the "Okta for AI Agents"'));
+      console.log(chalk.yellow('    feature is enabled, so todo0 tool calls will fail at runtime.'));
     }
 
     // Step 11: Create Access Policies

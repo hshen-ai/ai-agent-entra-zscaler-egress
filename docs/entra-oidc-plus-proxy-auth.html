@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="Henry Shen, Zscaler">
+<title>Entra ID web-app sign-in, extended with Zscaler proxy authentication</title>
+<style>
+  :root {
+    --ink:        #1A1A1A;   /* Microsoft diagram text is near-black, not tinted */
+    --ms-blue:    #0078D4;   /* the Token connector in the source diagram */
+    --ms-navy:    #243A5E;   /* Learn heading navy */
+    --egress:     #00847D;   /* NEW: the proxy-authenticated egress plane */
+    --refused:    #8A94A0;   /* NEW: the control row that makes a 200 mean anything */
+    --rule:       #D3D8DE;
+    --panel:      #F6F8FA;
+    --page:       #FFFFFF;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    font-size: 16px; line-height: 1.55;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 56px 28px 96px; }
+
+  header { border-bottom: 2px solid var(--ms-navy); padding-bottom: 20px; margin-bottom: 8px; }
+  h1 { font-size: 30px; line-height: 1.2; font-weight: 600; color: var(--ms-navy); margin: 0 0 10px; letter-spacing: -0.01em; }
+  .sub { font-size: 17px; color: #4A5568; max-width: 68ch; margin: 0; }
+  .byline { font-size: 14px; color: var(--ink); margin: 14px 0 0; }
+  .byline strong { font-weight: 600; }
+  .prov { font-size: 13px; color: #6B7280; margin: 14px 0 0; }
+  .prov code { font-size: 12px; }
+
+  h2 { font-size: 21px; font-weight: 600; color: var(--ms-navy); margin: 46px 0 6px; }
+  h3 { font-size: 16px; font-weight: 600; color: var(--ink); margin: 26px 0 4px; }
+  p  { max-width: 76ch; }
+
+  figure { margin: 32px 0 0; }
+  .canvas { border: 1px solid var(--rule); border-radius: 3px; background: #fff; overflow: hidden; }
+  svg { display: block; width: 100%; height: auto; }
+  figcaption { font-size: 13.5px; color: #6B7280; margin-top: 10px; max-width: 86ch; }
+
+  table { border-collapse: collapse; width: 100%; margin: 14px 0 0; font-size: 14.5px; }
+  th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--rule); }
+  th { font-weight: 600; color: var(--ms-navy); border-bottom: 2px solid var(--rule); white-space: nowrap; }
+  td:first-child { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  code, .mono { font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+  code { background: var(--panel); padding: 1px 5px; border-radius: 3px; }
+
+  .note {
+    border-left: 3px solid var(--egress); background: var(--panel);
+    padding: 16px 20px; margin: 22px 0 0; border-radius: 0 3px 3px 0;
+  }
+  .note.warn { border-left-color: #B45309; }
+  .note p { margin: 0; max-width: 72ch; }
+  .note p + p { margin-top: 10px; }
+  .note strong { color: var(--ms-navy); }
+
+  ol.reuse { max-width: 76ch; padding-left: 22px; }
+  ol.reuse li { margin-bottom: 10px; }
+  ol.reuse b { color: var(--ms-navy); }
+
+  footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--rule); font-size: 13px; color: #6B7280; }
+
+  @media print {
+    /* The drawing is 1480 x 1210 units, an aspect of 1.22. A4 landscape leaves only 188mm of
+       height, which scales the step labels to about 6pt - too small to read on paper. So the
+       figure gets its OWN A3 landscape page via a named page, and everything else stays A4
+       landscape. Measured: at 258mm tall the 14.5-unit labels land near 9pt and the 12.5-unit
+       monospace near 7.5pt. */
+    @page { size: A4 landscape; margin: 11mm 13mm; }
+    @page diagram { size: A3 landscape; margin: 10mm; }
+
+    .wrap { padding: 0; max-width: none; }
+    /* Page 1 is a cover: title, the one-paragraph summary, and where the base diagram
+       came from. Pushed down so it reads as deliberate rather than as a short page. */
+    header { padding-top: 38mm; margin-bottom: 0; }
+    h1 { font-size: 26px; }
+    h2 { page-break-after: avoid; font-size: 18px; margin: 26px 0 4px; }
+
+    figure { page: diagram; page-break-before: always; page-break-after: always;
+             page-break-inside: avoid; margin: 0; }
+    /* Height, not width, is the binding constraint - so cap the height and let the width
+       follow the viewBox. Without this the canvas border paginates away from its own SVG
+       and Chrome emits a blank page carrying nothing but the frame. */
+    .canvas { display: block; }
+    .canvas svg { max-height: 250mm; width: auto; margin: 0 auto; }
+    /* The 86ch measure is right for screen reading but wraps to three lines on a 420mm page,
+       and the third line was landing on a page of its own. Let it use the page width. */
+    figcaption { margin-top: 8px; max-width: none; font-size: 12.5px; }
+
+    table, .note, ol.reuse li, footer { page-break-inside: avoid; }
+    /* The screen's 64px top margin pushed the footer onto a page of its own. */
+    footer { margin-top: 26px; }
+    /* Backgrounds are information here: the legend panel and the two callouts rely on their
+       fill to read as set apart from the body text. */
+    .note, code, .canvas, .panel { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  }
+  @media (max-width: 720px) {
+    .wrap { padding: 32px 16px 64px; }
+    h1 { font-size: 24px; }
+    td:first-child { white-space: normal; }
+    /* A 1480-unit diagram scaled to a phone's width is unreadable. Let it keep a legible
+       width and scroll sideways instead of shrinking to illegibility. */
+    .canvas { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .canvas svg { min-width: 1040px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Entra ID web-app sign-in, extended with Zscaler proxy authentication</h1>
+  <p class="sub">Steps&nbsp;1–9 are Microsoft's own OpenID Connect web-app diagram, unchanged. Steps&nbsp;10–17
+  are this reference implementation's extension: how the agent reaches the internet through an authenticated Zscaler explicit
+  proxy <em>without a second sign-in</em>, by reusing the token the web-app flow already produced.</p>
+  <p class="byline"><strong>Henry Shen</strong> · Zscaler</p>
+  <p class="prov">Base diagram: <span class="mono">learn.microsoft.com/en-us/entra/architecture/auth-oidc</span>
+  · Extension built and verified on <span class="mono">agent0</span> / <span class="mono">todo0</span>. Identifiers shown are masked values from the reference lab.</p>
+  <p class="prov"><b>Personal work by Henry Shen — not an official Zscaler solution.</b> It does not represent Zscaler's official position and is not supported by Zscaler; it shares one way to configure and consume Zscaler products, <b>for educational purposes only — not for production use</b>.</p>
+</header>
+
+<figure>
+  <div class="canvas">
+  <svg viewBox="0 0 1480 1210" role="img" aria-labelledby="dgTitle dgDesc">
+    <title id="dgTitle">Entra ID OpenID Connect web-app sign-in extended with On-Behalf-Of token exchange and Zscaler proxy authentication</title>
+    <desc id="dgDesc">Four-actor sign-in flow (user, web browser, agent0 web app, Microsoft Entra ID) in steps 1 to 9,
+    followed by an On-Behalf-Of exchange in steps 10 and 11 that yields two audienced tokens, then an
+    egress plane in steps 12 to 17 where agent0 calls a loopback MCP server and reaches Amazon Bedrock
+    through a Zscaler explicit proxy that validates the token against the same Entra signing keys.</desc>
+
+    <defs>
+      <marker id="ahBlack" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,1 L9,5 L0,9 z" fill="#1A1A1A"/>
+      </marker>
+      <marker id="ahBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,1 L9,5 L0,9 z" fill="#0078D4"/>
+      </marker>
+      <marker id="ahEgress" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,1 L9,5 L0,9 z" fill="#00847D"/>
+      </marker>
+      <marker id="ahRefused" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,1 L9,5 L0,9 z" fill="#8A94A0"/>
+      </marker>
+      <style>
+        .box   { fill:#F6F8FA; stroke:#C3CAD2; stroke-width:1.25; }
+        .boxT  { font:600 15px "Segoe UI",Arial,sans-serif; fill:#243A5E; }
+        .boxS  { font:12.5px "SF Mono",Menlo,Consolas,monospace; fill:#6B7280; }
+        .lane  { fill:none; stroke:#1A1A1A; stroke-width:1.4; stroke-dasharray:1.5 3.5; }
+        .laneT { fill:none; stroke:#0078D4; stroke-width:1.4; stroke-dasharray:1.5 3.5; }
+        .laneE { fill:none; stroke:#00847D; stroke-width:1.9; }
+        .laneR { fill:none; stroke:#8A94A0; stroke-width:1.5; stroke-dasharray:7 5; }
+        .lbl   { font:14.5px "Segoe UI",Arial,sans-serif; fill:#1A1A1A; }
+        .lblT  { font:14.5px "Segoe UI",Arial,sans-serif; fill:#0078D4; }
+        .lblE  { font:14.5px "Segoe UI",Arial,sans-serif; fill:#00847D; }
+        .lblR  { font:14px "Segoe UI",Arial,sans-serif; fill:#6B7280; }
+        .mo    { font:12.5px "SF Mono",Menlo,Consolas,monospace; fill:#4A5568; }
+        .moE   { font:12.5px "SF Mono",Menlo,Consolas,monospace; fill:#00847D; }
+        .num   { font:600 13px "Segoe UI",Arial,sans-serif; fill:#FFFFFF; text-anchor:middle; }
+        .band  { font:600 13px "Segoe UI",Arial,sans-serif; fill:#8A94A0; letter-spacing:.09em; }
+      </style>
+    </defs>
+
+    <!-- ══ band separators, so the eye can see which half is Microsoft's ══ -->
+    <line x1="40" y1="556" x2="1440" y2="556" stroke="#E4E8EC" stroke-width="1"/>
+    <line x1="40" y1="752" x2="1440" y2="752" stroke="#E4E8EC" stroke-width="1"/>
+    <text class="band" x="40" y="34">1–9 · WEB APP SIGN-IN — MICROSOFT'S FLOW, UNCHANGED</text>
+    <text class="band" x="40" y="584" fill="#00847D">10–11 · TOKEN REUSE — ON-BEHALF-OF, NO SECOND SIGN-IN</text>
+    <text class="band" x="40" y="780" fill="#00847D">12–17 · EGRESS — THE SAME IDENTITY, AUTHENTICATED AT THE PROXY</text>
+
+    <!-- ══════════════ BAND 1 · Microsoft's nine steps ══════════════ -->
+
+    <!-- Web App (agent0) -->
+    <rect class="box" x="520" y="112" width="250" height="84" rx="4"/>
+    <text class="boxT" x="645" y="142" text-anchor="middle">Web App — agent0</text>
+    <text class="boxS" x="645" y="162" text-anchor="middle">client 1135xxxx-…-xxxxxxxx4766</text>
+    <text class="boxS" x="645" y="180" text-anchor="middle">confidential · client secret</text>
+
+    <!-- Microsoft Entra ID -->
+    <rect class="box" x="1180" y="250" width="250" height="84" rx="4"/>
+    <text class="boxT" x="1305" y="280" text-anchor="middle">Microsoft Entra ID</text>
+    <text class="boxS" x="1305" y="300" text-anchor="middle">tenant cddbxxxx-…-xxxxxxxxf7c6</text>
+    <text class="boxS" x="1305" y="318" text-anchor="middle">authorization + token endpoint</text>
+
+    <!-- Web Browser -->
+    <rect class="box" x="110" y="330" width="200" height="80" rx="4"/>
+    <text class="boxT" x="210" y="362" text-anchor="middle">Web Browser</text>
+    <text class="boxS" x="210" y="382" text-anchor="middle">session cookie agent0.sid</text>
+
+    <!-- User -->
+    <circle cx="210" cy="484" r="16" fill="none" stroke="#243A5E" stroke-width="1.6"/>
+    <path d="M186,516 a24,20 0 0 1 48,0" fill="none" stroke="#243A5E" stroke-width="1.6"/>
+    <text class="boxT" x="210" y="540" text-anchor="middle">User</text>
+
+    <!-- 1 · User opens browser -->
+    <path class="lane" d="M210,462 L210,418" marker-end="url(#ahBlack)"/>
+    <circle cx="210" cy="440" r="13" fill="#1A1A1A"/><text class="num" x="210" y="445">1</text>
+    <text class="lbl" x="236" y="445">User opens browser</text>
+
+    <!-- 2 · Navigates to web app -->
+    <path class="lane" d="M210,328 L210,140 L512,140" marker-end="url(#ahBlack)"/>
+    <circle cx="330" cy="140" r="13" fill="#1A1A1A"/><text class="num" x="330" y="145">2</text>
+    <text class="lbl" x="356" y="132">Navigates to web app</text>
+
+    <!-- 3 · Redirected to Microsoft Entra ID -->
+    <path class="lane" d="M772,140 L1305,140 L1305,242" marker-end="url(#ahBlack)"/>
+    <circle cx="900" cy="140" r="13" fill="#1A1A1A"/><text class="num" x="900" y="145">3</text>
+    <text class="lbl" x="926" y="132">Redirected to Microsoft Entra ID</text>
+
+    <!-- 4 and 5 · credentials, consent — one lane, two badges, as in the source -->
+    <path class="lane" d="M312,376 L1172,376" marker-end="url(#ahBlack)"/>
+    <circle cx="404" cy="376" r="13" fill="#1A1A1A"/><text class="num" x="404" y="381">4</text>
+    <text class="lbl" x="430" y="368">User enters credentials</text>
+    <circle cx="820" cy="376" r="13" fill="#1A1A1A"/><text class="num" x="820" y="381">5</text>
+    <text class="lbl" x="846" y="368">User consents to permissions</text>
+
+    <!-- 6 · Issues tokens -->
+    <path class="laneT" d="M1240,336 L1240,464 L210,464 L210,418" marker-end="url(#ahBlue)"/>
+    <circle cx="640" cy="464" r="13" fill="#0078D4"/><text class="num" x="640" y="469">6</text>
+    <text class="lblT" x="666" y="456">Issues tokens (access &amp; refresh token)</text>
+
+    <!-- 7 · Redirects access tokens to web app -->
+    <path class="lane" d="M132,330 L72,330 L72,182 L512,182" marker-end="url(#ahBlack)"/>
+    <circle cx="150" cy="182" r="13" fill="#1A1A1A"/><text class="num" x="150" y="187">7</text>
+    <text class="lbl" x="230" y="172">Redirects access tokens to web app</text>
+
+    <!-- 8 · Validates access token -->
+    <path class="laneT" d="M700,58 L700,104" marker-end="url(#ahBlue)"/>
+    <circle cx="700" cy="72" r="13" fill="#0078D4"/><text class="num" x="700" y="77">8</text>
+    <text class="lblT" x="726" y="66">Validates access token</text>
+    <text class="mo" x="726" y="86">signature via jwks_uri · iss · aud · exp</text>
+
+    <!-- 9 · Returns secure page to user -->
+    <path class="laneT" d="M520,124 L46,124 L46,484 L182,484" marker-end="url(#ahBlue)"/>
+    <circle cx="46" cy="200" r="13" fill="#0078D4"/><text class="num" x="46" y="205">9</text>
+    <text class="lblT" x="64" y="116">Returns secure page to user</text>
+
+    <!-- ══════════════ BAND 2 · On-Behalf-Of ══════════════ -->
+
+    <!-- 10 · agent0 -> Entra, the user's own token as the assertion -->
+    <path class="laneE" d="M600,198 L600,630 L1262,630 L1262,342" marker-end="url(#ahEgress)"/>
+    <circle cx="790" cy="630" r="13" fill="#00847D"/><text class="num" x="790" y="635">10</text>
+    <text class="lblE" x="816" y="622">On-Behalf-Of exchange — <tspan font-weight="600">no new credential from the user</tspan></text>
+    <text class="moE" x="816" y="644">POST /oauth2/v2.0/token · grant_type=…:jwt-bearer · assertion = the step-7 token</text>
+
+    <!-- 11 · Entra -> agent0, two audienced tokens -->
+    <path class="laneE" d="M1348,342 L1348,706 L690,706 L690,198" marker-end="url(#ahEgress)"/>
+    <circle cx="860" cy="706" r="13" fill="#00847D"/><text class="num" x="860" y="711">11</text>
+    <text class="lblE" x="886" y="698">Two access tokens, one user, two audiences</text>
+    <text class="moE" x="886" y="720">aud=todo0 (MCP) · aud=zia-egress (proxy) · email claim = ZIA username</text>
+
+    <!-- ══════════════ BAND 3 · egress plane ══════════════ -->
+
+    <!-- todo0 MCP -->
+    <rect class="box" x="90" y="856" width="250" height="84" rx="4"/>
+    <text class="boxT" x="215" y="886" text-anchor="middle">todo0 MCP server</text>
+    <text class="boxS" x="215" y="906" text-anchor="middle">http://localhost:5002/mcp</text>
+    <text class="boxS" x="215" y="924" text-anchor="middle">aud d5ccxxxx-…-xxxxxxxx5729</text>
+
+    <!-- ZIA -->
+    <rect class="box" x="560" y="1010" width="320" height="94" rx="4" stroke="#00847D" stroke-width="1.6"/>
+    <text class="boxT" x="720" y="1042" text-anchor="middle" fill="#00847D">Zscaler Internet Access</text>
+    <text class="boxS" x="720" y="1062" text-anchor="middle">explicit proxy 185.46.xxx.xxx:80</text>
+    <text class="boxS" x="720" y="1080" text-anchor="middle">subject_claim = email</text>
+
+    <!-- ZID Token Validator -->
+    <rect class="box" x="1180" y="856" width="250" height="84" rx="4" stroke="#00847D" stroke-width="1.6"/>
+    <text class="boxT" x="1305" y="886" text-anchor="middle" fill="#00847D">ZIdentity Token Validator</text>
+    <text class="boxS" x="1305" y="906" text-anchor="middle">iss + jwks_uri, from the</text>
+    <text class="boxS" x="1305" y="924" text-anchor="middle">same tenant as step 3</text>
+
+    <!-- Amazon Bedrock -->
+    <rect class="box" x="1180" y="1044" width="250" height="70" rx="4"/>
+    <text class="boxT" x="1305" y="1074" text-anchor="middle">Amazon Bedrock</text>
+    <text class="boxS" x="1305" y="1094" text-anchor="middle">bedrock-runtime.eu-central-1</text>
+
+    <!-- 12 · agent0 -> MCP, loopback, not proxied -->
+    <path class="laneE" d="M540,198 L540,898 L348,898" marker-end="url(#ahEgress)"/>
+    <circle cx="540" cy="820" r="13" fill="#00847D"/><text class="num" x="540" y="825">12</text>
+    <text class="lblE" x="90" y="818">MCP call, token from step 11</text>
+    <text class="moE" x="90" y="838">loopback — NOT proxied, no JWT on this hop</text>
+
+    <!-- 13 · agent0 -> ZIA, the authenticated CONNECT -->
+    <path class="laneE" d="M660,198 L660,1002" marker-end="url(#ahEgress)"/>
+    <circle cx="660" cy="866" r="13" fill="#00847D"/><text class="num" x="660" y="871">13</text>
+    <text class="lblE" x="686" y="862">CONNECT through the explicit proxy</text>
+    <text class="moE" x="686" y="882">Proxy-Authorization: Bearer &lt;zia-egress token&gt;</text>
+
+    <!-- 14 · the control row -->
+    <path class="laneR" d="M790,198 L790,1002" marker-end="url(#ahRefused)"/>
+    <circle cx="790" cy="944" r="13" fill="#8A94A0"/><text class="num" x="790" y="949">14</text>
+    <text class="lblR" x="816" y="940">Control row — the same CONNECT, header omitted</text>
+    <text class="mo" x="816" y="959">407 Proxy Authentication Required · this is what makes the 200 mean anything</text>
+
+    <!-- 15 · ZIA -> validator -->
+    <path class="laneE" d="M882,1040 L1030,1040 L1030,898 L1172,898" marker-end="url(#ahEgress)"/>
+    <circle cx="1030" cy="1010" r="13" fill="#00847D"/><text class="num" x="1030" y="1015">15</text>
+    <text class="lblE" x="1056" y="1000">Validate the token</text>
+    <text class="moE" x="1056" y="1020">signature · exp · then match email to a ZIA user</text>
+
+    <!-- 16 · validator -> Entra jwks -->
+    <path class="laneE" d="M1400,848 L1400,342" marker-end="url(#ahEgress)"/>
+    <circle cx="1400" cy="600" r="13" fill="#00847D"/><text class="num" x="1400" y="605">16</text>
+    <text class="lblE" x="1380" y="800" text-anchor="end">jwks_uri — the same signing keys</text>
+    <text class="lblE" x="1380" y="820" text-anchor="end" font-weight="600">that signed step 6.</text>
+    <text class="moE" x="1380" y="842" text-anchor="end">This is where reuse becomes trust.</text>
+
+    <!-- 17 · ZIA -> Bedrock -->
+    <path class="laneE" d="M880,1078 L1172,1078" marker-end="url(#ahEgress)"/>
+    <circle cx="1026" cy="1078" r="13" fill="#00847D"/><text class="num" x="1026" y="1083">17</text>
+    <text class="lblE" x="1026" y="1056" text-anchor="middle">200 Connection Established</text>
+
+    <!-- ══ legend ══ -->
+    <rect x="90" y="990" width="416" height="146" rx="3" fill="#FFFFFF" stroke="#C3CAD2"/>
+    <text class="boxT" x="112" y="1018" fill="#0078D4">Connector Type</text>
+    <path class="lane" d="M252,1046 L118,1046" marker-end="url(#ahBlack)"/>
+    <text class="lbl" x="276" y="1051">Authentication</text>
+    <path class="laneT" d="M252,1076 L118,1076" marker-end="url(#ahBlue)"/>
+    <text class="lblT" x="276" y="1081">Token</text>
+    <path class="laneE" d="M252,1106 L118,1106" marker-end="url(#ahEgress)"/>
+    <text class="lblE" x="276" y="1111">Proxy-authenticated egress</text>
+    <text class="lblR" x="276" y="1131">Refused — negative control</text>
+    <path class="laneR" d="M252,1126 L118,1126" marker-end="url(#ahRefused)"/>
+  </svg>
+  </div>
+  <figcaption>Steps 1–9 and the Authentication / Token connector styles are Microsoft's. Steps 10–17,
+  the third and fourth connector types, and the four boxes drawn with a teal outline are this reference implementation's
+  extension. The extension adds no new sign-in: every token below the first divider descends from the
+  access token issued at step&nbsp;6. Masked lab identifiers in the drawing: <code>client</code> = &lt;AGENT0_CLIENT_ID&gt;, <code>tenant</code> = &lt;TENANT_ID&gt;, todo0 <code>aud</code> = &lt;TODO0_APP_ID&gt;, <code>explicit proxy</code> = &lt;ZIA_PROXY&gt;.</figcaption>
+</figure>
+
+<h2>What is actually reused</h2>
+<p>"Reuse" here is four specific things, not a general resemblance. Each one is why the proxy leg needs
+no second login and no second credential store:</p>
+<ol class="reuse">
+  <li><b>The sign-in itself.</b> Steps 1–9 happen once, in the browser. The user never sees a prompt for
+  the proxy. Steps 10–17 are entirely server-to-server.</li>
+  <li><b>The user's access token, as the assertion.</b> The On-Behalf-Of exchange at step 10 presents the
+  <em>same</em> token the web app received at step 7 as its <code>assertion</code>. Entra therefore knows
+  the request is made on behalf of a user who has already authenticated interactively — including any MFA
+  and the consent from step 5.</li>
+  <li><b>The signing keys.</b> The Token Validator at step 16 fetches <code>jwks_uri</code> from the same
+  tenant that signed step 6. It is not a separate trust anchor bolted on for the proxy; the proxy trusts
+  exactly the tokens the sign-in produced. <b>This is the load-bearing reuse</b> — it is what makes the
+  identity on the wire the same identity that logged in.</li>
+  <li><b>The identity, end to end.</b> The <code>oid</code> from the id&nbsp;token is the
+  <code>userId</code> on the database row the agent writes through MCP; the <code>email</code> claim from
+  the same token is the username Zscaler logs against the Bedrock request. One login, one human, visible
+  in both planes.</li>
+</ol>
+
+<h2>Where this diagram deliberately differs from Microsoft's</h2>
+<table>
+  <thead><tr><th>Source diagram</th><th>What agent0 actually does</th><th>Why the difference matters</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>6 — "Issues tokens" to the browser; 7 — "Redirects access tokens to web app"</td>
+      <td><b>Authorization code + PKCE.</b> Step 6 delivers a <code>code</code>; step 7 hands that code to
+      <code>/callback</code>; agent0 exchanges it server-side with its client secret for the id token and
+      access token.</td>
+      <td>No token ever transits the browser, and the token that becomes the OBO assertion at step 10 only
+      ever exists server-side. The Learn diagram's shape would put it in the user agent.</td>
+    </tr>
+    <tr>
+      <td>"Web App" as a single box</td>
+      <td>Two registered applications — <code>agent0</code> and <code>todo0</code> — each with its own
+      client id, its own consent grant and its own session cookie.</td>
+      <td>First-time consent (step 5) is <b>per application</b>. agent0 consenting does not consent todo0,
+      even for the same user and the same three scopes.</td>
+    </tr>
+    <tr>
+      <td>Flow ends at step 9 with a secure page</td>
+      <td>Step 9 is where the interesting part <em>starts</em>: the session now holds a token that can be
+      exchanged for other audiences.</td>
+      <td>The proxy leg is a consequence of the web-app flow, not a parallel mechanism beside it.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>The two things this does not do</h2>
+<div class="note warn">
+  <p><strong>The MCP hop at step 12 is not proxy-authenticated, and cannot be.</strong> It is a loopback
+  call inside one container. Proxy authentication only applies to <em>explicit-proxy egress</em>, so there
+  is no JWT on that hop; the token it carries is the todo0-audienced OAuth token, which is a different
+  control. A diagram that drew a Zscaler connector on step 12 would be wrong.</p>
+  <p><strong>The proxy must be explicit, not a default route.</strong> Traffic that reaches the internet
+  over a plain default-route tunnel bypasses JWT authentication <em>silently and open</em> — it succeeds,
+  and nothing in the response says the identity was never checked. The tell that authentication is
+  genuinely in force is step&nbsp;14: omit the header and the proxy must answer <code>407</code> with a
+  Bearer challenge. If omitting it still yields a connection, the egress path is not the one drawn here.</p>
+</div>
+
+<h2>Session level and process level are two different identities</h2>
+<p>Step 11 mints a token per <em>logged-in session</em>. An agent also makes calls that belong to no
+session — start-up, health checks, background work — and those need a separate, process-level identity of
+their own. The two are deliberately not fallbacks for each other: a session with no token must fail with
+a <code>407</code> rather than quietly borrow the process identity, because attribution in the proxy log
+is the entire point of doing this.</p>
+<p>In this reference implementation the Entra path ships the <b>session level only</b> —
+<code>GET /api/zia/status</code> reports <code>{"session":{…},"process":null}</code>. A process-level
+workload identity is an extension point: it needs a non-interactive credential of its own, and must
+stay separate from every user session.</p>
+
+<h2>What has to exist on the Zscaler side</h2>
+<div class="note">
+  <p><strong>A ZIdentity Token Validator for the Entra issuer.</strong> Issuer
+  <code>https://login.microsoftonline.com/&lt;TENANT_ID&gt;/v2.0</code>, JWKS URL
+  <code>…/&lt;TENANT_ID&gt;/discovery/v2.0/keys</code>, Subject Claim <code>email</code>, and a required claim
+  <code>aud = &lt;ZIA_EGRESS_APP_ID&gt;</code> — the last is what stops a token issued for another
+  application in the same tenant from authenticating to the proxy. Masked lab example:
+  <code>https://login.microsoftonline.com/cddbxxxx-xxxx-xxxx-xxxx-xxxxxxxxf7c6/v2.0</code>,
+  <code>aud = a015xxxx-xxxx-xxxx-xxxx-xxxxxxxxc4d6</code>.</p>
+  <p><strong>A ZIA user per identity</strong>, whose username equals the token's <code>email</code> claim —
+  which Entra fills from the user's <code>mail</code> attribute. A token whose <code>email</code> matches no
+  ZIA user is validly signed and still refused with <code>407</code>.</p>
+  <p><strong>The explicit proxy, with JWT authentication enabled for that traffic</strong> —
+  <code>&lt;ZIA_PROXY&gt;</code>, e.g. <code>185.46.xxx.xxx:80</code> or
+  <code>gateway.&lt;zscaler-cloud&gt;.net:80</code>. ZIdentity's "Test Token" checks only signature and
+  expiry; the acceptance test is step&nbsp;14's <code>407</code> next to step&nbsp;17's <code>200</code>.</p>
+</div>
+
+<footer>
+  Extension verified end to end: headless sign-in through Entra's own login pages →
+  <code>strategy: obo</code>, <code>connected: true</code> → a todo written under the user's
+  <code>oid</code> (<code>userId=9b5bxxxx-…</code>) → read back by todo0 under its own independent
+  login. Base diagram © Microsoft, from the Entra architecture documentation.
+  This document is personal work by Henry Shen, not an official Zscaler solution, and is not
+  supported by Zscaler. Educational use only — not for production. For supported configurations,
+  refer to Zscaler's official documentation.
+</footer>
+
+</div>
+</body>
+</html>

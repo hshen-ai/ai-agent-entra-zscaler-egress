@@ -10,6 +10,9 @@
 // AuthTokenResult discriminated union.
 import { TokenExchangeHandler, TokenExchangeConfig } from './authorization-server/handler.js';
 import { OAuthStsHandler, OAuthStsConfig } from './application/handler.js';
+// Entra's On-Behalf-Of exchange. A real import rather than the require() used inside okta-auth.ts,
+// because this file needs the CONFIG TYPE at compile time, not just the function at runtime.
+import { entraOnBehalfOf, loadEntraOboConfig } from '../auth/entra-obo.js';
 
 // ============================================================================
 // Result shape (discriminated union)
@@ -24,7 +27,10 @@ export type AuthTokenResult =
 // Strategy interface
 // ============================================================================
 
-export type AuthStrategyKind = 'id-jag' | 'oauth-sts';
+// 'obo' is Entra's equivalent of 'id-jag'. Both turn a login artifact into a resource token; the
+// difference is that Entra rejects RFC 8693 token-exchange (AADSTS70003) and starts from an ACCESS
+// token rather than an ID token.
+export type AuthStrategyKind = 'id-jag' | 'oauth-sts' | 'obo';
 
 export interface AuthStrategy {
   readonly kind: AuthStrategyKind;
@@ -143,12 +149,91 @@ export class OAuthStsAuthStrategy implements AuthStrategy {
 }
 
 // ============================================================================
+// Entra On-Behalf-Of adapter
+// ============================================================================
+// Sits with the other two adapters, above the "MCP connection config" banner, because that is
+// where a reader looks for it. Anchoring on the banner's own comment and stepping back over it is
+// what keeps it here rather than wedged between that banner and the type it introduces.
+
+export interface OboStrategyConfig {
+  tenantId: string;
+  clientId: string;
+  clientSecret: string;
+  /**
+   * Space-delimited scopes for ONE downstream resource. An access token carries exactly one
+   * audience, so a second resource is a second connection, not a longer string here.
+   */
+  scope: string;
+}
+
+export class OboAuthStrategy implements AuthStrategy {
+  readonly kind = 'obo' as const;
+  readonly resource: string;
+  private config: OboStrategyConfig;
+
+  constructor(config: OboStrategyConfig) {
+    this.config = config;
+    // Derived, not configured twice: the scopes already carry `api://<appId>/`, so stripping the
+    // last path segment off the first one IS the resource. One source of truth for both.
+    this.resource = (config.scope.split(' ')[0] || '').replace(/\/[^/]*$/, '');
+  }
+
+  /**
+   * Turn an unqualified scope into a fully qualified one. todo0 answers an insufficient-scope
+   * failure with SHORT names (`mcp:connect`), and those come back here as requestedScopes for the
+   * step-up retry. Okta accepts them bare; Entra requires `api://<appId>/mcp:connect`. Anything
+   * already carrying a scheme is passed through untouched.
+   */
+  private qualify(scopes: string): string {
+    return scopes
+      .split(' ')
+      .filter((s) => s.length > 0)
+      .map((s) => (s.includes('://') ? s : `${this.resource}/${s}`))
+      .join(' ');
+  }
+
+  /**
+   * `subjectToken` is the signed-in user's agent0-audience ACCESS token - NOT an ID token. See
+   * auth/entra-obo.ts: OBO's assertion has to be audienced at agent0 itself, which is why the login
+   * requests api://<agent0>/agent.access. agent.ts selects the right token for this strategy kind.
+   */
+  async getAccessToken(subjectToken: string, requestedScopes?: string): Promise<AuthTokenResult> {
+    try {
+      const token = await entraOnBehalfOf(
+        this.config,
+        subjectToken,
+        this.qualify(requestedScopes || this.config.scope),
+      );
+      return {
+        status: 'success',
+        accessToken: token.accessToken,
+        expiresIn: token.expiresIn,
+        scope: token.scope,
+      };
+    } catch (err: any) {
+      // Never 'interaction_required': preAuthorizedApplications removes consent entirely on this
+      // tenant, so there is no URI to send the user to and a fabricated one would be a dead link.
+      // The AADSTS text in the message is what names the real cause.
+      return {
+        status: 'error',
+        error: 'entra_obo_failed',
+        errorDescription: err?.message || String(err),
+      };
+    }
+  }
+
+  /** Nothing is cached, matching the id-jag adapter: every connect mints a fresh token. */
+  clearCache(): void { /* no-op */ }
+}
+
+// ============================================================================
 // MCP connection config (auth strategy + server URL)
 // ============================================================================
 
 export type McpAuthStrategyConfig =
   | { kind: 'id-jag'; config: TokenExchangeConfig }
-  | { kind: 'oauth-sts'; config: OAuthStsConfig };
+  | { kind: 'oauth-sts'; config: OAuthStsConfig }
+  | { kind: 'obo'; config: OboStrategyConfig };
 
 export interface McpConnectionConfig {
   /** Stable id used in logs, tool-dispatch map, and ConnectionStatus details. */
@@ -167,6 +252,12 @@ export interface McpConnectionConfig {
 
 /** Factory — turns a config bundle into a live AuthStrategy instance. */
 export function buildAuthStrategy(cfg: McpAuthStrategyConfig): AuthStrategy {
+  // FIRST in the function, which is not a style choice. The existing body ends with a bare
+  // `return new OAuthStsAuthStrategy(cfg.config);` that relies on narrowing having eliminated every
+  // other arm. Adding 'obo' last would not merely be unreachable - that bare return would then
+  // receive an OboStrategyConfig and fail to compile. Narrowing it away first is the only placement
+  // that type-checks without editing the lines below.
+  if (cfg.kind === 'obo') return new OboAuthStrategy(cfg.config);
   if (cfg.kind === 'id-jag') return new IdJagAuthStrategy(cfg.config);
   return new OAuthStsAuthStrategy(cfg.config);
 }
@@ -202,7 +293,10 @@ export function loadMcpConnectionConfigs(): McpConnectionConfig[] {
   const hasAgentIdentity = !!(oktaDomain && agentId && privateKeyFile && privateKeyKid);
 
   // --- Entry 1: Primary MCP via ID-JAG --------------------------------------
-  if (!isConnectionDisabled('authorization_server')) {
+  // Skipped entirely on Entra. It would already self-exclude for want of AI_AGENT_PRIVATE_KEY_FILE,
+  // but that makes the exclusion an accident of which variables the env file omits; this makes it
+  // true by construction, and visible here rather than inferable from somewhere else.
+  if ((process.env.IDP ?? 'okta') !== 'entra' && !isConnectionDisabled('authorization_server')) {
     const mcpServerUrl = process.env.MCP_SERVER_URL;
     const authServer = process.env.MCP_AUTHORIZATION_SERVER;
     const tokenEndpoint = process.env.MCP_AUTHORIZATION_SERVER_TOKEN_ENDPOINT;
@@ -254,6 +348,37 @@ export function loadMcpConnectionConfigs(): McpConnectionConfig[] {
           },
         },
       });
+    }
+  }
+
+  // --- Entry 3: Primary MCP via Entra On-Behalf-Of ---------------------------
+  // The Entra replacement for Entry 1, and deliberately NOT gated on hasAgentIdentity: OBO
+  // authenticates agent0 with its client secret, so there is no client assertion, no signing key,
+  // and AI_AGENT_PRIVATE_KEY_FILE is meaningless on this path.
+  //
+  // Keeps id: 'primary' so agent.ts's tool-dispatch map and ConnectionStatus details do not change -
+  // the IDP switch stays invisible to every consumer of this list.
+  if ((process.env.IDP ?? 'okta') === 'entra' && !isConnectionDisabled('authorization_server')) {
+    const entraMcpUrl = process.env.MCP_SERVER_URL;
+    const entraMcpScopes = process.env.ENTRA_TODO0_SCOPES;
+    const entraOboConfig = loadEntraOboConfig();
+
+    if (entraMcpUrl && entraMcpScopes && entraOboConfig) {
+      out.push({
+        id: 'primary',
+        serverUrl: entraMcpUrl,
+        displayName: 'Todo0 MCP Server',
+        resourceIndicator: process.env.MCP_RESOURCE_INDICATOR || entraMcpUrl,
+        auth: {
+          kind: 'obo',
+          config: { ...entraOboConfig, scope: entraMcpScopes },
+        },
+      });
+    } else {
+      // Said once, at startup, naming the variable. The alternative is an empty tool list and a
+      // chat window that just has no tools, with nothing in the log to explain why.
+      console.warn('[entra] IDP=entra but MCP_SERVER_URL / ENTRA_TODO0_SCOPES / the OBO config is '
+        + 'incomplete - the tool plane will not connect');
     }
   }
 

@@ -28,7 +28,7 @@ export interface RegisterAgentRequest {
     name: string;
     description: string;
   };
-  appId: string;
+  signOnProvider: { type: 'EXISTING_APP'; appInstanceId: string };
 }
 
 export interface AgentOperationResult {
@@ -247,7 +247,7 @@ export class AgentIdentityAPIClient {
 
       const operationUrl = response.headers['location'];
       if (!operationUrl) {
-        throw new Error('No Location header in activation response');
+        return '';  // already ACTIVE on this org: 202 with no operation to poll
       }
 
       return operationUrl;

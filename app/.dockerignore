@@ -1,0 +1,10 @@
+node_modules
+.git
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+!**/.env.*.example
+**/*.pem
+.okta-bootstrap-state.json
+okta-config-report.md

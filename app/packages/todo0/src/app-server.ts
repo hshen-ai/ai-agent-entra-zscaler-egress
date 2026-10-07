@@ -133,8 +133,19 @@ app.use(helmet({
       scriptSrc: ["'self'", "'unsafe-inline'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
       formAction: null, // Disable form-action restriction (needed for OAuth redirects)
+      // This origin is HTTP on purpose (every Okta redirect URI here is http://), and helmet's
+      // DEFAULT set includes upgrade-insecure-requests, which rewrites every fetch from this page
+      // to https://<host>:<same port>. Nothing serves TLS on that port, so the browser reports
+      // `Failed to fetch` and the UI hangs on "Connecting to server...". Invisible on localhost,
+      // which is exempt from the upgrade as a potentially-trustworthy origin - so it only breaks
+      // off-host, e.g. through ZPA. Measured 2026-09-16.
+      upgradeInsecureRequests: null,
     },
   },
+  // Also a helmet default. A browser ignores an STS header received over plain HTTP, so it is
+  // inert today - but it would pin these hostnames to HTTPS for a year the moment anything
+  // serves them over TLS. Removed here rather than left as a trap for the next person.
+  hsts: false,
 }));
 
 // Logging middleware

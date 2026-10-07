@@ -416,6 +416,30 @@ export async function getAgentForUserContext(idToken: string, userContext: UserC
 const subjectToAgent = new Map<string, Agent>();
 
 export async function getAgentForSession (req: Request): Promise<Agent | null> {
+  const ziaInner = await getAgentForSessionInner(req);
+  // Hand this session's OWN ZIA egress token to this session's Agent. subjectToAgent below already
+  // keys one Agent per Okta subject, so bedrockClient and its ziaAgent closure are already
+  // per-user; createConnection reads this property off `this` on every CONNECT.
+  //
+  // Copied on EVERY request, not at Agent creation: the Agent is cached for the process lifetime,
+  // so a one-time copy would pin the first login's identity onto every later request. `?? null`
+  // is the fail-closed half - a session with no token CLEARS the property, so the next CONNECT
+  // goes out with no Proxy-Authorization and ZIA answers 407, rather than reusing a stale
+  // identity. There is no fallback to the process-level workload token by design.
+  if (ziaInner) (ziaInner as any).ziaSessionToken = (req.session as any).ziaToken ?? null;
+  // The same carry for the tool plane, and deliberately a SECOND property rather than a reuse of the
+  // one above: ziaToken is audienced at zia-egress and goes into Proxy-Authorization, while this one
+  // is audienced at agent0 and is the OBO subject. Swapping them yields an opaque AADSTS or a 407.
+  //
+  // Per request for the same reason as ziaSessionToken: the Agent is cached for the process lifetime,
+  // so a one-time copy would pin the first login's token onto every later request. `?? null` is the
+  // fail-closed half - OboAuthStrategy turns an empty subject into status:'error' rather than calling
+  // Entra with nothing. Okta deploys never read this property.
+  if (ziaInner) (ziaInner as any).entraUserToken = (req.session as any).accessToken ?? null;
+  return ziaInner;
+}
+
+async function getAgentForSessionInner (req: Request): Promise<Agent | null> {
   const userInfo = req.session.userInfo;
   const idToken = req.session.idToken;
   if (!userInfo || !userInfo.sub || !idToken) {
@@ -438,6 +462,15 @@ export async function getAgentForSession (req: Request): Promise<Agent | null> {
 
   subjectToAgent.set(subject, agent);
 
+  // connect() below performs the OBO exchange, so the subject token has to be on the Agent BEFORE it
+  // runs. getAgentForSession assigns entraUserToken after this function RETURNS, which is right for
+  // every later tool call and too late for this one: the Agent is then cached in subjectToAgent and
+  // MCP connect is once-per-process, so the failure is permanent for that login. Without this line a
+  // browser login ends in `entra_obo_failed no user access token on the session` and an empty tool
+  // list, while the headless probe - which POSTs to /mcp itself - passes.
+  // ziaSessionToken needs no equivalent: it is read at CONNECT time, always later than this.
+  // Okta reads neither property; IdJagAuthStrategy takes its subject from the id token.
+  (agent as any).entraUserToken = (req.session as any).accessToken ?? null;
   await agent.connect();
 
   return agent;
@@ -541,6 +574,134 @@ export class Agent {
       config.awsSecretAccessKey &&
       config.enableLLM !== false
     ) {
+      // ZIA SSL inspection does not negotiate ALPN (measured 2026-09-15: offering
+      // h2,http/1.1 through the tunnel yields alpnProtocol === false). The AWS SDK installs
+      // NodeHttp2Handler for bedrock-runtime by default, so every call dies at the transport
+      // layer with "Protocol error", which surfaces to the user as
+      // "LLM processing failed: Protocol error". Certificates are fine - NODE_EXTRA_CA_CERTS
+      // fixes validation, not ALPN. HTTP/1.1 through the inspected tunnel works.
+      //
+      // @smithy/node-http-handler is a transitive dep of @aws-sdk/client-bedrock-runtime and
+      // NOT a direct dependency of this package, so under pnpm's strict node_modules layout a
+      // plain import would fail to resolve. Resolve it through the bedrock client's own
+      // resolution root instead of adding a dependency.
+      const { createRequire } = require("module");
+      const bedrockRequire = createRequire(require.resolve("@aws-sdk/client-bedrock-runtime"));
+      const { NodeHttpHandler } = bedrockRequire("@smithy/node-http-handler");
+      // --- ZIA Workload JWT Authentication ---------------------------------------------------
+      // Bedrock must not use the default route. Default-route traffic is inspected by ZIA but never
+      // authenticated - measured 2026-09-16 from inside this container, direct TLS to
+      // bedrock-runtime.eu-central-1.amazonaws.com succeeds with authorized=true and no challenge.
+      // Only an explicit proxy CONNECT is authenticated, and the credential must ride the CONNECT
+      // itself as `Proxy-Authorization: Bearer <jwt>` - not as an HTTP request header.
+      //
+      // ZIA_PROXY is your ZIA explicit proxy as host:port (lab example: 185.46.xxx.xxx:80). There is
+      // deliberately no default: the Service Edge differs per Zscaler cloud and region, and a wrong
+      // default fails as a confusing 407. Unset, every Bedrock call fails with an error naming it.
+      // Measured from inside this container: no token -> "HTTP/1.1 407 Unauthorized";
+      // valid token -> "HTTP/1.1 200 Connection Established".
+      const ziaNet = require("net");
+      const ziaTls = require("tls");
+      const ziaFs = require("fs");
+      const [ziaHost, ziaPort] = (process.env.ZIA_PROXY ?? "").split(":");
+      // OPT-IN ONLY, and deliberately without a default path. The token normally arrives on the
+      // session (see below); this is just the hand-injection escape hatch that keeps
+      // probe_zia_connect_live_token.js usable. A default would be actively harmful:
+      // /app/packages/agent0/.zia-token.jwt still holds a stale token from an earlier login, so every
+      // session without one of its own would silently egress as THAT user instead of being refused.
+      const ziaTokenFile = process.env.ZIA_TOKEN_FILE;
+
+      // keepAlive is REQUIRED, and not for performance. With it off, Node puts `Connection: close` on
+      // the inner request and ZIA's proxy resets the tunnel: measured 2026-09-16 at n=20 against
+      // bedrock-runtime through the ZIA explicit proxy, `Connection: close` -> 2/20, `Connection: keep-alive`
+      // -> 20/20, over identical CONNECTs. That is the whole reason curl looked reliable while the SDK
+      // was flaky - curl never sends `Connection: close`. The failure is an ECONNRESET after a
+      // successful handshake, with the request written and zero bytes read back.
+      // keepSocketAlive then returns false so the socket is still destroyed after each response, which
+      // keeps what the plain no-keepAlive agent was for: one authenticated CONNECT per Bedrock call
+      // (measured CONNECTs=20 for 20 calls), a fresh token read every time, and one line per call in
+      // ZIA Web Insights. Plain keepAlive:true reuses one tunnel for every call (CONNECTs=1), which
+      // would authenticate once at startup and then ride that session indefinitely.
+      const ziaAgent = new (require("https").Agent)({ keepAlive: true });
+      ziaAgent.keepSocketAlive = () => false;
+      ziaAgent.createConnection = (opts: any, cb: any) => {
+        const target = `${opts.host}:${opts.port ?? 443}`;
+        if (!ziaHost || !ziaPort) {
+          return cb(new Error("ZIA_PROXY is not set - expected host:port of the ZIA explicit proxy"));
+        }
+        const sock = ziaNet.connect(Number(ziaPort), ziaHost);
+        sock.once("error", cb);
+        sock.once("connect", () => {
+          // Resolve the token on EVERY CONNECT, never in a closure at client-construction time: a ZIA
+          // JWT lives 60 minutes and a re-minted one has to take effect immediately. Order:
+          //
+          //   1. THIS SESSION'S OWN TOKEN. `this` is the Agent instance - subjectToAgent in agent.ts
+          //      already keys one Agent per Okta subject, and getAgentForSession copies that session's
+          //      req.session.ziaToken onto it on every request, so two concurrent logins egress as two
+          //      different identities rather than as whoever logged in last. createConnection is an
+          //      arrow function inside an Agent method, which is what lets `this` reach in here.
+          //   2. ZIA_TOKEN_FILE, and only if the variable is actually set.
+          //   3. Nothing - FAIL CLOSED. The CONNECT still goes out, without a credential, so ZIA
+          //      answers 407 and the error reads "the proxy refused us". There is deliberately NO
+          //      fallback to the process-level workload token: a user session quietly egressing as
+          //      agent0-workload would destroy the per-user attribution this whole path exists for.
+          let ziaToken = (this as any).ziaSessionToken ?? null;
+          if (!ziaToken && ziaTokenFile) {
+            try {
+              ziaToken = ziaFs.readFileSync(ziaTokenFile, "utf8").trim();
+            } catch {
+              // An opt-in path that cannot be read is a misconfiguration, not a normal state, so say
+              // so - the path only, never the contents.
+              console.error("[ZIA] ZIA_TOKEN_FILE is set but unreadable: " + ziaTokenFile);
+            }
+          }
+          const auth = ziaToken ? `Proxy-Authorization: Bearer ${ziaToken}\r\n` : "";
+          sock.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n${auth}\r\n`);
+        });
+        // Read the CONNECT response with once("readable") + read(), never with on("data"). A "data"
+        // listener puts the socket in flowing mode permanently - removeListener does not pause it - so
+        // bytes arriving between the 200 and tls.connect() taking over get read off the socket and
+        // dropped. ZIA sends 0 trailing bytes today, so this is latent rather than active, but a proxy
+        // is allowed to put the first payload in the same segment as the 200 and those bytes belong to
+        // TLS. https-proxy-agent avoids flowing mode for exactly this reason.
+        let buf = "";
+        const onReadable = () => {
+          let chunk: Buffer | null;
+          while ((chunk = sock.read()) !== null) buf += chunk.toString("latin1");
+          const end = buf.indexOf("\r\n\r\n");
+          if (end < 0) {
+            sock.once("readable", onReadable);   // header split across segments: `buf` keeps the prefix
+            return;
+          }
+          const status = buf.slice(0, buf.indexOf("\r\n"));
+          if (!/^HTTP\/1\.[01] 200\b/.test(status)) {
+            sock.destroy();
+            // Deliberately does not include the request - `auth` carries the token.
+            return cb(new Error(`ZIA proxy refused CONNECT ${target}: ${status}`));
+          }
+          // Measured 0 bytes here, but a proxy is allowed to send the first payload in the same
+          // segment as the 200, and those bytes belong to TLS.
+          const rest = buf.slice(end + 4);
+          if (rest.length) sock.unshift(Buffer.from(rest, "latin1"));
+          sock.removeListener("error", cb);
+          // Carry the caller's own TLS options through - `ca`, `rejectUnauthorized`, `minVersion`,
+          // `checkServerIdentity` and anything else the SDK set. Only the dialing fields are dropped,
+          // because we already have the socket. Passing just {socket, servername} silently discards
+          // them, which shows up as a bogus "self-signed certificate" from a perfectly good chain.
+          const tlsOpts = Object.assign({}, opts);
+          delete tlsOpts.host;
+          delete tlsOpts.port;
+          delete tlsOpts.path;
+          tlsOpts.socket = sock;
+          tlsOpts.servername = opts.servername ?? opts.host;
+          // ZIA's inspection negotiates no ALPN on this path (measured alpn=false), so ask for
+          // http/1.1 only. HTTP/2 through the inspected proxy dies as a bare "Protocol error".
+          tlsOpts.ALPNProtocols = ["http/1.1"];
+          cb(null, ziaTls.connect(tlsOpts));
+        };
+        sock.once("readable", onReadable);
+      };
+
       this.bedrockClient = new BedrockRuntimeClient({
         region: config.awsRegion,
         credentials: {
@@ -548,6 +709,7 @@ export class Agent {
           secretAccessKey: config.awsSecretAccessKey,
           sessionToken: config.awsSessionToken,
         },
+        requestHandler: new NodeHttpHandler({ httpsAgent: ziaAgent }),
       });
       console.log('🤖 LLM integration enabled (AWS Bedrock)');
     } else {
@@ -657,7 +819,14 @@ export class Agent {
       console.log(`   Server: ${mcp.config.serverUrl}`);
       console.log(`   Auth strategy: ${mcp.strategy.kind}`);
 
-      const tokenResult = await mcp.strategy.getAccessToken(this.config.idToken, requestedScopes);
+      // The subject differs by IDP: id-jag exchanges the ID token, OBO requires the user's ACCESS token
+      // audienced at agent0 (an ID token is rejected outright). Selected here because only this scope
+      // holds both, and on `kind` because that discriminator already exists - it is logged one line up.
+      // The else branch is the original expression verbatim, so the Okta path is unchanged.
+      const subjectToken = mcp.strategy.kind === 'obo'
+        ? ((this as any).entraUserToken ?? '')
+        : this.config.idToken;
+      const tokenResult = await mcp.strategy.getAccessToken(subjectToken, requestedScopes);
 
       if (tokenResult.status === 'interaction_required') {
         console.log(`🔐 MCP [${mcp.config.id}] reports interaction_required — consent pending.`);
