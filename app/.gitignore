@@ -1,0 +1,26 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+.env.backup
+.env.app
+.env.agent
+.env.mcp
+.env.*.backup
+.DS_Store
+*.log
+coverage/
+*.tsbuildinfo
+*.sqlite
+*.db
+packages/*/node_modules/
+packages/*/dist/
+packages/*/build/
+*.pem
+
+# Okta bootstrap state
+.okta-bootstrap-state.json
+okta-config-report.md
+security-fixes.md
+CLAUDE.md
